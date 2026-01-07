@@ -148,7 +148,7 @@ with tab1:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         with st.expander("DataFrame"):
             st.dataframe(df.tail(10))
@@ -161,6 +161,6 @@ with tab2:
     st.info("Korean ETFs excluding Inverse, Leverage, and Hedged products.")
     try:
         top_etfs = get_top_etfs(20)
-        st.dataframe(top_etfs, use_container_width=True)
+        st.dataframe(top_etfs, width="stretch")
     except Exception as e:
         st.error(f"Error fetching ETF data: {e}")
