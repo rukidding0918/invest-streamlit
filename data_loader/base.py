@@ -14,3 +14,8 @@ class DataLoader(ABC):
     def get_vix_history(self, start_date: str, end_date: str) -> pd.DataFrame:
         """Fetch VIX index history."""
         pass
+
+    @abstractmethod
+    def get_etf_list(self) -> pd.DataFrame:
+        """Fetch list of ETFs."""
+        pass
