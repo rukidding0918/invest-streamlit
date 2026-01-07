@@ -1,501 +1,154 @@
+from datetime import date, timedelta
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
-import yaml
-import os
-from pathlib import Path
-from datetime import datetime
-import uuid
 
-# 보안 참고사항:
-# 이 구현은 개발/데모 목적입니다. 프로덕션 환경에서는:
-# - 비밀번호 해싱 (bcrypt, argon2 등) 구현
-# - 마크다운 콘텐츠 sanitization (unsafe_allow_html 사용 시 XSS 위험)
-# - 환경 변수를 통한 민감 정보 관리
-# - HTTPS 사용 필수
+from data_loader import get_loader
 
-# 페이지 설정
-st.set_page_config(
-    page_title="블루힐 한의원",
-    page_icon="🏥",
-    layout="wide"
+st.set_page_config(page_title="Invest Streamlit", layout="wide")
+
+st.sidebar.title("Settings")
+data_source = st.sidebar.selectbox("Data Source", ["fdr", "pykrx"], index=0)
+loader = get_loader(data_source)
+
+# Select Index
+available_indices = ["KOSPI", "KOSDAQ", "S&P 500", "NASDAQ", "Dow Jones", "Nikkei 225"]
+selected_index = st.sidebar.selectbox("Select Index", available_indices, index=0)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Additional Indicators")
+show_vix = st.sidebar.checkbox("Show VIX Index", value=False)
+
+# Date Range Picker
+today = date.today()
+default_start = today - timedelta(days=365)
+date_range = st.sidebar.date_input(
+    "Select Date Range",
+    value=(default_start, today),
+    max_value=today
 )
 
-# 사용자 데이터 로드
-@st.cache_resource
-def load_users():
-    """users.yaml 파일에서 사용자 정보를 로드합니다."""
-    try:
-        with open('users.yaml', 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
-            return data.get('users', {})
-    except FileNotFoundError:
-        st.error("users.yaml 파일을 찾을 수 없습니다.")
-        return {}
+# Handle date range selection
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_date, end_date = date_range
+else:
+    start_date, end_date = default_start, today
 
-# 데이터 로드 함수들
-def load_data(filename):
-    """YAML 파일에서 데이터를 로드합니다."""
-    try:
-        filepath = f'data/{filename}'
-        if not os.path.exists(filepath):
-            return []
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
-            # inquiries, reviews, columns 키에서 데이터 추출
-            key = filename.replace('.yaml', '')
-            return data.get(key, []) if data else []
-    except Exception as e:
-        st.error(f"데이터 로드 중 오류 발생: {str(e)}")
-        return []
+# Fetch index data
+try:
+    df = loader.get_index_ohlcv(selected_index, start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"))
+except Exception as e:
+    st.error(f"Error fetching {selected_index} from {data_source}: {e}")
+    df = None
 
-def save_data(filename, data):
-    """데이터를 YAML 파일에 저장합니다."""
-    try:
-        filepath = f'data/{filename}'
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        key = filename.replace('.yaml', '')
-        with open(filepath, 'w', encoding='utf-8') as f:
-            yaml.dump({key: data}, f, allow_unicode=True, default_flow_style=False)
-        return True
-    except Exception as e:
-        st.error(f"데이터 저장 중 오류 발생: {str(e)}")
-        return False
+if df is not None and not df.empty:
+    window = 20
+    df['MA20'] = df['종가'].rolling(window=window).mean()
+    df['std'] = df['종가'].rolling(window=window).std()
+    
+    # Bollinger Bands calculation
+    for i in [1, 2, 3]:
+        df[f'Upper{i}'] = df['MA20'] + (df['std'] * i)
+        df[f'Lower{i}'] = df['MA20'] - (df['std'] * i)
 
-# 세션 상태 초기화
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-if 'username' not in st.session_state:
-    st.session_state.username = None
-if 'role' not in st.session_state:
-    st.session_state.role = None
-if 'user_name' not in st.session_state:
-    st.session_state.user_name = None
+    # Fetch VIX if requested
+    vix_df = None
+    if show_vix:
+        try:
+            vix_df = loader.get_vix_history(start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"))
+            if not vix_df.empty:
+                # Align VIX data to KOSPI dates (ffill for missing dates like holidays)
+                vix_df = vix_df[['Close']].reindex(df.index).ffill().bfill()
+        except Exception as e:
+            st.warning(f"Could not fetch VIX data: {e}")
 
-def login(username, password):
-    """사용자 로그인을 처리합니다."""
-    users = load_users()
-    if username in users and users[username]['password'] == password:
-        st.session_state.logged_in = True
-        st.session_state.username = username
-        st.session_state.role = users[username]['role']
-        st.session_state.user_name = users[username]['name']
-        return True
-    return False
+    # Determine subplot rows
+    num_rows = 3 if show_vix and vix_df is not None and not vix_df.empty else 2
+    row_heights = [0.5, 0.25, 0.25] if num_rows == 3 else [0.7, 0.3]
+    subplot_titles = (selected_index, "Volume", "VIX Index") if num_rows == 3 else (selected_index, "Volume")
 
-def logout():
-    """사용자 로그아웃을 처리합니다."""
-    st.session_state.logged_in = False
-    st.session_state.username = None
-    st.session_state.role = None
-    st.session_state.user_name = None
+    fig = make_subplots(rows=num_rows, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.05, 
+                        row_heights=row_heights,
+                        subplot_titles=subplot_titles)
 
-def load_markdown_file(filepath):
-    """마크다운 파일을 읽어 반환합니다."""
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return f.read()
-    except FileNotFoundError:
-        return f"⚠️ 파일을 찾을 수 없습니다: {filepath}"
-    except Exception as e:
-        return f"⚠️ 파일을 읽는 중 오류가 발생했습니다: {str(e)}"
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df.index.strftime("%Y-%m-%d"),
+        open=df['시가'], high=df['고가'],
+        low=df['저가'], close=df['종가'],
+        name=selected_index
+    ), row=1, col=1)
 
-def display_public_content(category, subcategory):
-    """공개 콘텐츠를 표시합니다."""
-    # 파일명 매핑
-    file_mapping = {
-        "한의원": {
-            "의료진": "01_의료진.md",
-            "위치및진료시간": "02_위치및진료시간.md",
-            "칼럼": "03_칼럼.md"
-        },
-        "진료과목": {
-            "통증치료": "04_통증치료.md",
-            "추나요법": "05_추나요법.md",
-            "녹용한약": "06_녹용한약.md",
-            "공진단": "07_공진단.md"
-        }
+    # Bollinger Bands Visualization (Shaded)
+    # Order: 3std -> 2std -> 1std (stacking from outside in)
+    band_colors = {
+        1: 'rgba(100, 149, 237, 0.3)', # Deepest (inner)
+        2: 'rgba(100, 149, 237, 0.2)', 
+        3: 'rgba(100, 149, 237, 0.1)'  # Lightest (outer)
     }
+    
+    # Trace for shaded regions using 'fill'
+    # We iterate backwards to ensure inner bands are filled on top or combined
+    for i in [3, 2, 1]:
+        # Upper line (anchor)
+        fig.add_trace(go.Scatter(
+            x=df.index.strftime("%Y-%m-%d"), y=df[f'Upper{i}'],
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo='skip'
+        ), row=1, col=1)
+        
+        # Lower line with fill to Upper line
+        fig.add_trace(go.Scatter(
+            x=df.index.strftime("%Y-%m-%d"), y=df[f'Lower{i}'],
+            line=dict(width=0),
+            fill='tonexty',
+            fillcolor=band_colors[i],
+            name=f'Bollinger {i}std',
+            hoverinfo='skip'
+        ), row=1, col=1)
 
-    filename = file_mapping.get(category, {}).get(subcategory)
-    if not filename:
-        st.error("콘텐츠를 찾을 수 없습니다.")
-        return
+    # MA20 line on top of fills
+    fig.add_trace(go.Scatter(
+        x=df.index.strftime("%Y-%m-%d"), y=df['MA20'],
+        line=dict(color='orange', width=2),
+        name='MA20'
+    ), row=1, col=1)
 
-    filepath = os.path.join('content/public', filename)
+    # Volume
+    fig.add_trace(go.Bar(
+        x=df.index.strftime("%Y-%m-%d"),
+        y=df['거래량'],
+        name="Volume",
+        marker_color='blue'
+    ), row=2, col=1)
 
-    # 경로 순회 공격 방지
-    if '..' in filename or os.path.sep in filename:
-        st.error("⚠️ 잘못된 파일명입니다.")
-        return
+    # VIX Index
+    if num_rows == 3:
+        fig.add_trace(go.Scatter(
+            x=df.index.strftime("%Y-%m-%d"), # Use KOSPI index to align with category axis
+            y=vix_df['Close'],
+            name="VIX",
+            line=dict(color='red', width=2)
+        ), row=3, col=1)
 
-    if not os.path.abspath(filepath).startswith(os.path.abspath('content/public')):
-        st.error("⚠️ 잘못된 파일 경로입니다.")
-        return
-
-    content = load_markdown_file(filepath)
-
-    # 칼럼 페이지인 경우 저장된 칼럼 목록도 표시
-    if subcategory == "칼럼":
-        st.markdown(content)
-        st.divider()
-
-        columns_data = load_data('columns.yaml')
-        if columns_data:
-            st.subheader("📰 작성된 칼럼")
-            for col in sorted(columns_data, key=lambda x: x['created_at'], reverse=True):
-                with st.expander(f"📝 {col['title']} - {col['created_at'][:10]}"):
-                    st.markdown(f"**작성자**: {col['author']}")
-                    st.markdown(f"**작성일**: {col['created_at']}")
-                    st.divider()
-                    st.markdown(col['content'])
-        else:
-            st.info("아직 작성된 칼럼이 없습니다.")
-    else:
-        st.markdown(content)
-
-def show_inquiry_form():
-    """문의글 작성 폼을 표시합니다."""
-    st.subheader("💬 문의글 작성")
-
-    with st.form("inquiry_form"):
-        title = st.text_input("제목", max_chars=100)
-        content = st.text_area("내용", height=200)
-        is_private = st.checkbox("비공개 문의 (작성자와 관리자만 볼 수 있습니다)")
-
-        submitted = st.form_submit_button("문의글 등록", use_container_width=True)
-
-        if submitted:
-            if not title or not content:
-                st.error("제목과 내용을 모두 입력해주세요.")
-            else:
-                inquiries = load_data('inquiries.yaml')
-                new_inquiry = {
-                    'id': str(uuid.uuid4()),
-                    'author': st.session_state.username,
-                    'author_name': st.session_state.user_name,
-                    'title': title,
-                    'content': content,
-                    'is_private': is_private,
-                    'answered': False,
-                    'answer': None,
-                    'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                inquiries.append(new_inquiry)
-                if save_data('inquiries.yaml', inquiries):
-                    st.success("문의글이 등록되었습니다!")
-                    st.rerun()
-
-def show_inquiry_list():
-    """문의글 목록을 표시합니다."""
-    st.subheader("💬 문의글 목록")
-
-    inquiries = load_data('inquiries.yaml')
-
-    if not inquiries:
-        st.info("아직 작성된 문의글이 없습니다.")
-        return
-
-    # 사용자별 필터링
-    if st.session_state.role != 'admin':
-        # 일반 사용자: 공개 글 + 본인이 작성한 비공개 글만 표시
-        inquiries = [
-            inq for inq in inquiries
-            if not inq['is_private'] or inq['author'] == st.session_state.username
-        ]
-
-    for inq in sorted(inquiries, key=lambda x: x['created_at'], reverse=True):
-        privacy_badge = "🔒 비공개" if inq['is_private'] else "🌐 공개"
-        answer_badge = "✅ 답변완료" if inq['answered'] else "⏳ 대기중"
-
-        with st.expander(f"{privacy_badge} {answer_badge} | {inq['title']} - {inq['author_name']} ({inq['created_at'][:10]})"):
-            st.markdown(f"**작성자**: {inq['author_name']}")
-            st.markdown(f"**작성일**: {inq['created_at']}")
-            st.markdown(f"**공개여부**: {privacy_badge}")
-            st.divider()
-            st.markdown("**문의 내용:**")
-            st.write(inq['content'])
-
-            if inq['answered']:
-                st.divider()
-                st.markdown("**답변:**")
-                st.info(inq['answer'])
-
-def show_review_form():
-    """후기 작성 폼을 표시합니다."""
-    st.subheader("⭐ 후기 작성")
-
-    with st.form("review_form"):
-        title = st.text_input("제목", max_chars=100)
-        content = st.text_area("내용", height=200)
-
-        submitted = st.form_submit_button("후기 등록", use_container_width=True)
-
-        if submitted:
-            if not title or not content:
-                st.error("제목과 내용을 모두 입력해주세요.")
-            else:
-                reviews = load_data('reviews.yaml')
-                new_review = {
-                    'id': str(uuid.uuid4()),
-                    'author': st.session_state.username,
-                    'author_name': st.session_state.user_name,
-                    'title': title,
-                    'content': content,
-                    'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                reviews.append(new_review)
-                if save_data('reviews.yaml', reviews):
-                    st.success("후기가 등록되었습니다!")
-                    st.rerun()
-
-def show_review_list():
-    """후기 목록을 표시합니다."""
-    st.subheader("⭐ 치료 후기")
-
-    reviews = load_data('reviews.yaml')
-
-    if not reviews:
-        st.info("아직 작성된 후기가 없습니다.")
-        return
-
-    for review in sorted(reviews, key=lambda x: x['created_at'], reverse=True):
-        with st.expander(f"⭐ {review['title']} - {review['author_name']} ({review['created_at'][:10]})"):
-            st.markdown(f"**작성자**: {review['author_name']}")
-            st.markdown(f"**작성일**: {review['created_at']}")
-            st.divider()
-            st.markdown(review['content'])
-
-def show_admin_inquiry_management():
-    """관리자 문의글 관리 페이지를 표시합니다."""
-    st.subheader("🔧 문의글 관리")
-
-    # 필터
-    filter_option = st.radio(
-        "필터",
-        ["전체", "답변 대기", "답변 완료"],
-        horizontal=True
+    # Remove date gaps (including holidays) by treating x-axis as category
+    for r in range(1, num_rows + 1):
+        fig.update_xaxes(type='category', tickangle=-45, row=r, col=1)
+    
+    fig.update_layout(
+        xaxis_rangeslider_visible=True, # Enable the range slider back
+        height=900, # Increased height to accommodate the slider
+        margin=dict(t=50, b=50, l=50, r=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    inquiries = load_data('inquiries.yaml')
+    st.plotly_chart(fig, width="stretch")
 
-    if not inquiries:
-        st.info("아직 작성된 문의글이 없습니다.")
-        return
+    with st.expander("DataFrame"):
+        st.dataframe(df.tail(10))
 
-    # 필터링
-    if filter_option == "답변 대기":
-        inquiries = [inq for inq in inquiries if not inq['answered']]
-    elif filter_option == "답변 완료":
-        inquiries = [inq for inq in inquiries if inq['answered']]
-
-    for idx, inq in enumerate(sorted(inquiries, key=lambda x: x['created_at'], reverse=True)):
-        privacy_badge = "🔒 비공개" if inq['is_private'] else "🌐 공개"
-        answer_badge = "✅ 답변완료" if inq['answered'] else "⏳ 대기중"
-
-        with st.expander(f"{privacy_badge} {answer_badge} | {inq['title']} - {inq['author_name']} ({inq['created_at'][:10]})"):
-            st.markdown(f"**작성자**: {inq['author_name']} ({inq['author']})")
-            st.markdown(f"**작성일**: {inq['created_at']}")
-            st.markdown(f"**공개여부**: {privacy_badge}")
-            st.divider()
-            st.markdown("**문의 내용:**")
-            st.write(inq['content'])
-
-            st.divider()
-
-            # 답변 폼
-            if inq['answered']:
-                st.markdown("**답변:**")
-                st.info(inq['answer'])
-                if st.button("답변 수정", key=f"edit_{inq['id']}"):
-                    st.session_state[f"editing_{inq['id']}"] = True
-                    st.rerun()
-
-                if st.session_state.get(f"editing_{inq['id']}", False):
-                    new_answer = st.text_area("답변 수정", value=inq['answer'], key=f"answer_edit_{inq['id']}")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("수정 완료", key=f"save_edit_{inq['id']}", use_container_width=True):
-                            all_inquiries = load_data('inquiries.yaml')
-                            for i, item in enumerate(all_inquiries):
-                                if item['id'] == inq['id']:
-                                    all_inquiries[i]['answer'] = new_answer
-                                    break
-                            if save_data('inquiries.yaml', all_inquiries):
-                                st.session_state[f"editing_{inq['id']}"] = False
-                                st.success("답변이 수정되었습니다!")
-                                st.rerun()
-                    with col2:
-                        if st.button("취소", key=f"cancel_edit_{inq['id']}", use_container_width=True):
-                            st.session_state[f"editing_{inq['id']}"] = False
-                            st.rerun()
-            else:
-                answer = st.text_area("답변 작성", key=f"answer_{inq['id']}", height=150)
-                if st.button("답변 등록", key=f"submit_{inq['id']}", use_container_width=True):
-                    if answer:
-                        all_inquiries = load_data('inquiries.yaml')
-                        for i, item in enumerate(all_inquiries):
-                            if item['id'] == inq['id']:
-                                all_inquiries[i]['answered'] = True
-                                all_inquiries[i]['answer'] = answer
-                                break
-                        if save_data('inquiries.yaml', all_inquiries):
-                            st.success("답변이 등록되었습니다!")
-                            st.rerun()
-                    else:
-                        st.error("답변 내용을 입력해주세요.")
-
-def show_admin_column_form():
-    """관리자 칼럼 작성 폼을 표시합니다."""
-    st.subheader("📝 칼럼 작성")
-
-    with st.form("column_form"):
-        title = st.text_input("제목", max_chars=100)
-        content = st.text_area("내용", height=400)
-
-        submitted = st.form_submit_button("칼럼 등록", use_container_width=True)
-
-        if submitted:
-            if not title or not content:
-                st.error("제목과 내용을 모두 입력해주세요.")
-            else:
-                columns = load_data('columns.yaml')
-                new_column = {
-                    'id': str(uuid.uuid4()),
-                    'author': st.session_state.user_name,
-                    'title': title,
-                    'content': content,
-                    'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                columns.append(new_column)
-                if save_data('columns.yaml', columns):
-                    st.success("칼럼이 등록되었습니다!")
-                    st.rerun()
-
-    # 기존 칼럼 목록
-    st.divider()
-    st.subheader("📰 작성된 칼럼 목록")
-    columns = load_data('columns.yaml')
-
-    if columns:
-        for col in sorted(columns, key=lambda x: x['created_at'], reverse=True):
-            with st.expander(f"📝 {col['title']} - {col['created_at'][:10]}"):
-                st.markdown(f"**작성자**: {col['author']}")
-                st.markdown(f"**작성일**: {col['created_at']}")
-                st.divider()
-                st.markdown(col['content'])
-
-                if st.button("삭제", key=f"delete_col_{col['id']}"):
-                    all_columns = load_data('columns.yaml')
-                    all_columns = [c for c in all_columns if c['id'] != col['id']]
-                    if save_data('columns.yaml', all_columns):
-                        st.success("칼럼이 삭제되었습니다!")
-                        st.rerun()
-    else:
-        st.info("아직 작성된 칼럼이 없습니다.")
-
-# 메인 애플리케이션
-def main():
-    # 사이드바 - 로그인/로그아웃
-    with st.sidebar:
-        st.title("🔐 인증")
-
-        if not st.session_state.logged_in:
-            st.subheader("로그인")
-            username = st.text_input("사용자명", key="login_username")
-            password = st.text_input("비밀번호", type="password", key="login_password")
-
-            if st.button("로그인", use_container_width=True):
-                if login(username, password):
-                    st.success(f"환영합니다, {st.session_state.user_name}님!")
-                    st.rerun()
-                else:
-                    st.error("사용자명 또는 비밀번호가 잘못되었습니다.")
-        else:
-            st.success(f"👤 {st.session_state.user_name}")
-            st.info(f"🎭 역할: {st.session_state.role}")
-
-            if st.button("로그아웃", use_container_width=True):
-                logout()
-                st.rerun()
-
-        st.divider()
-
-        # 사용자 안내
-        with st.expander("ℹ️ 테스트 계정"):
-            st.markdown("""
-            **일반 사용자:**
-            - user1 / password1
-            - user2 / password2
-
-            **관리자:**
-            - admin1 / admin123
-            """)
-
-    # 메인 콘텐츠 영역
-    st.title("🏥 블루힐 한의원")
-
-    # 메뉴 탭 생성
-    tabs = ["🏥 한의원", "💊 진료과목", "💬 문의하기", "⭐ 치료후기"]
-
-    if st.session_state.role == 'admin':
-        tabs.extend(["🔧 문의글 관리", "📝 칼럼 작성"])
-
-    selected_tabs = st.tabs(tabs)
-
-    # 한의원 탭
-    with selected_tabs[0]:
-        st.header("🏥 한의원 소개")
-        subcategory = st.radio(
-            "메뉴 선택",
-            ["의료진", "위치및진료시간", "칼럼"],
-            horizontal=True,
-            key="clinic_menu"
-        )
-        st.divider()
-        display_public_content("한의원", subcategory)
-
-    # 진료과목 탭
-    with selected_tabs[1]:
-        st.header("💊 진료과목")
-        subcategory = st.radio(
-            "진료과목 선택",
-            ["통증치료", "추나요법", "녹용한약", "공진단"],
-            horizontal=True,
-            key="treatment_menu"
-        )
-        st.divider()
-        display_public_content("진료과목", subcategory)
-
-    # 문의하기 탭
-    with selected_tabs[2]:
-        if st.session_state.logged_in:
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                show_inquiry_form()
-            with col2:
-                show_inquiry_list()
-        else:
-            st.warning("로그인 후 이용 가능합니다.")
-            show_inquiry_list()  # 공개 문의글은 비로그인 상태에서도 볼 수 있음
-
-    # 치료후기 탭
-    with selected_tabs[3]:
-        if st.session_state.logged_in:
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                show_review_form()
-            with col2:
-                show_review_list()
-        else:
-            st.warning("로그인 후 후기 작성이 가능합니다.")
-            show_review_list()  # 후기는 비로그인 상태에서도 볼 수 있음
-
-    # 관리자 전용 탭들
-    if st.session_state.role == 'admin':
-        with selected_tabs[4]:
-            show_admin_inquiry_management()
-
-        with selected_tabs[5]:
-            show_admin_column_form()
-
-if __name__ == "__main__":
-    main()
+else:
+    st.error("No data available for the specified date range.")
